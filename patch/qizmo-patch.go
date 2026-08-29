@@ -1,0 +1,581 @@
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+const (
+	originalSHA256 = "db4e91bbc40a03e422c4ebec1e1a27a1" +
+		"45bdd0bbcd0fb498741b6281c92ee8ef"
+	patchedSHA256 = "d89552a997a5210be790a315e0ad2915" +
+		"2988de38b9a473e3d69ad3677a98951e"
+)
+
+// replacement describes one validated patch site in the executable.
+type replacement struct {
+	Name   string
+	Offset int
+	Before []byte
+	After  []byte
+}
+
+// patch groups the byte changes for one independently understandable
+// modification. Patches are applied in the order listed here.
+type patch struct {
+	Name         string
+	Description  string
+	Replacements []replacement
+}
+
+// Integrity patch
+
+// Qizmo's original startup integrity mechanism XORs every 32-bit word in
+// its own executable and expects the result to be zero. The executable was
+// crafted to satisfy that checksum. On success the scanner replaces a
+// callback that initially points at a recursive trap with a no-op callback.
+// Any ordinary binary patch changes the XOR and therefore leaves the trap
+// selected.
+//
+// Merely initializing the callback to the success value avoids the trap,
+// but still makes Qizmo open and scan the entire executable on every start.
+// Retire the mechanism completely instead:
+//
+//  1. Jump over the scanner call while retaining the surrounding push/add
+//     pair, so the caller's stack behavior is unchanged.
+//  2. Jump over the later indirect callback invocation.
+//  3. Jump over the callback comparison and integrity-failure handler.
+//
+// The skipped scanner and its two callbacks then have no remaining callers.
+// Their bytes are deliberately left intact for forensic comparison and may
+// be overwritten by later feature patches using the cave map below.
+var integrityPatch = patch{
+	Name:        "integrity",
+	Description: "remove the integrity check",
+	Replacements: []replacement{
+		{
+			Name:   "skip executable scanner",
+			Offset: 0x5afcc,
+			Before: []byte{0xe8, 0x1b}, // call 0x08072cec
+			After:  []byte{0xeb, 0x03}, // jmp  0x080a2fd1
+		},
+		{
+			Name:   "skip integrity callback",
+			Offset: 0x5bc63,
+			Before: []byte{0xa1, 0x30}, // mov eax, [0x080d0b30]
+			After:  []byte{0xeb, 0x05}, // jmp 0x080a3c6a
+		},
+		{
+			Name:   "skip integrity failure guard",
+			Offset: 0x5be1f,
+			Before: []byte{0x8b, 0x0d}, // mov ecx, [0x080d0b4c]
+			After:  []byte{0xeb, 0x3f}, // jmp 0x080a3e60
+		},
+	},
+}
+
+// After the banner patch, the retired integrity mechanism leaves these code
+// caves available for later patches. File offsets are listed first,
+// followed by virtual addresses and sizes:
+//
+//   0x2aceb / 0x08072ceb: 213 executable bytes, through 0x08072dbf
+//   0x5afce / 0x080a2fce:   3 executable bytes
+//   0x5bc65 / 0x080a3c65:   5 executable bytes
+//   0x5be2e / 0x080a3e2e:  50 executable bytes
+//   0x5e57b / 0x080a657b:   1 executable byte
+//   0x87ac0 / 0x080d0ac0:  33 writable data bytes
+//
+// Total: 272 executable bytes and 33 writable data bytes.
+
+// Banner patch
+
+// The integrity patch makes Qizmo's recursive trap and encoded warning
+// data unreachable. Reuse those bytes for two tiny printf trampolines, the
+// attribution string, and the repository URL. Both strings are stored at
+// the end of the retired data so that the remaining 33-byte data cave stays
+// contiguous. Replacing the existing "\nF" banner boundary and its final
+// "\n\n" with same-size "%s" placeholders keeps the original banner
+// exactly the same size and does not change any other message.
+var bannerPatch = patch{
+	Name:        "banner",
+	Description: "add the compatibility attribution and repository URL",
+	Replacements: []replacement{
+		{
+			Name:   "repository URL storage",
+			Offset: 0x87ae1,
+			Before: []byte{
+				0xdb, 0x85, 0x8f, 0xdd, 0xd3, 0x85,
+				0x8d, 0xdc, 0xe1, 0xd7, 0x85, 0x90,
+				0xe2, 0xe1, 0xe3, 0xd9, 0xc8, 0xd7,
+				0xdd, 0xd8, 0xdd, 0x8e, 0x81, 0xcf,
+				0xd2, 0x84, 0x99, 0xe8, 0xe4, 0x95,
+				0x83, 0xc4, 0xcf, 0x8e,
+			},
+			After: []byte(
+				" | https://github.com/osm/qizmo" +
+					"\n\n\x00",
+			),
+		},
+		{
+			Name:   "attribution storage",
+			Offset: 0x87b03,
+			Before: []byte{
+				0x8b, 0xd4, 0xdc, 0xe6, 0x7d, 0x6b,
+				0xcd, 0xd8, 0x8c, 0x84, 0xc5, 0xd5,
+				0xd5, 0x81, 0x8f, 0xdd, 0x8e, 0x99,
+				0xe8, 0xe4, 0xe7, 0x92, 0x88, 0xc9,
+				0xd3, 0xd6, 0x84, 0x84, 0xcd, 0xdc,
+				0xde, 0x8b, 0x87, 0xd6, 0xde, 0xd3,
+				0xc6, 0xdb, 0xde, 0x93, 0x38, 0x0a,
+				0x00, 0x00, 0x00, 0x70, 0x65, 0x0a,
+				0x08,
+			},
+			After: []byte(
+				"\nCompatibility fixes by " +
+					"Oscar Linderholm, 2026\nF\x00",
+			),
+		},
+		{
+			Name:   "banner format placeholder",
+			Offset: 0x7da3b,
+			Before: []byte("\nF"),
+			After:  []byte("%s"),
+		},
+		{
+			Name:   "repository URL format placeholder",
+			Offset: 0x7da8f,
+			Before: []byte("\n\n"),
+			After:  []byte("%s"),
+		},
+		{
+			Name:   "banner printf trampoline",
+			Offset: 0x5e56e,
+			Before: []byte{
+				0x89, 0xf6, 0x55, 0x89, 0xe5, 0xe8, 0xf8,
+				0xff, 0xff, 0xff, 0x89, 0xec, 0x5d,
+			},
+			After: []byte{
+				// movl $0x080d0b03, 8(%esp)
+				0xc7, 0x44, 0x24, 0x08, 0x03, 0x0b,
+				0x0d, 0x08,
+				// jmp 0x080a3e21
+				0xe9, 0xa6, 0xd8, 0xff, 0xff,
+			},
+		},
+		{
+			Name:   "repository URL argument trampoline",
+			Offset: 0x5be21,
+			Before: []byte{
+				0x4c, 0x0b, 0x0d, 0x08, 0x81, 0xb9, 0x50,
+				0x35, 0x00, 0x00, 0x70, 0x65, 0x0a,
+			},
+			After: []byte{
+				// movl $0x080d0ae1, 12(%esp)
+				0xc7, 0x44, 0x24, 0x0c, 0xe1, 0x0a,
+				0x0d, 0x08,
+				// jmp 0x080727a8
+				0xe9, 0x7a, 0xe9, 0xfc, 0xff,
+			},
+		},
+		{
+			Name:   "banner print call",
+			Offset: 0x5ae96,
+			// call 0x080727a8
+			Before: []byte{0xe8, 0x0d, 0xf9, 0xfc, 0xff},
+			// call 0x080a656e
+			After: []byte{0xe8, 0xd3, 0x36, 0x00, 0x00},
+		},
+	},
+}
+
+// Userinfo patch
+
+const (
+	originalLimit = 196
+	patchedLimit  = 1024
+)
+
+// Qizmo reserves different amounts of userinfo space for its own keys in
+// each path. Add 1024 - 196 to every historical threshold so those
+// reservations are preserved while adopting the modern QuakeWorld limit.
+var userinfoPatch = patch{
+	Name: "userinfo",
+	Description: fmt.Sprintf(
+		"raise the userinfo limit from %d to %d bytes",
+		originalLimit,
+		patchedLimit,
+	),
+	Replacements: []replacement{
+		{
+			Name:   "connect limit (connected mode)",
+			Offset: 0x31023,
+			Before: []byte{0xb1, 0x00, 0x00, 0x00}, // 177
+			After:  []byte{0xed, 0x03, 0x00, 0x00}, // 1005
+		},
+		{
+			Name:   "connect limit (direct mode)",
+			Offset: 0x31034,
+			Before: []byte{0xbd, 0x00, 0x00, 0x00}, // 189
+			After:  []byte{0xf9, 0x03, 0x00, 0x00}, // 1017
+		},
+		{
+			Name:   "setinfo limit (connected mode)",
+			Offset: 0x3a393,
+			Before: []byte{0xbb, 0x00, 0x00, 0x00}, // 187
+			After:  []byte{0xf7, 0x03, 0x00, 0x00}, // 1015
+		},
+		{
+			Name:   "setinfo limit (direct mode)",
+			Offset: 0x3a3de,
+			Before: []byte{0xc7, 0x00, 0x00, 0x00}, // 199
+			After:  []byte{0x03, 0x04, 0x00, 0x00}, // 1027
+		},
+	},
+}
+
+// Sound dependency patch
+
+const soundLibraryDependency = "$ORIGIN/qizmo-sound.so"
+
+// Qizmo is already a dynamically linked ELF executable. Make the Linux
+// sound compatibility driver an ordinary dependency so the system loader
+// maps it before Qizmo starts and its constructor can install the capture
+// callbacks and OSS compatibility hooks. This removes the need for a
+// preload launcher.
+//
+// The original .dynamic section has only its terminating DT_NULL entry, but
+// it is followed by enough zero padding for one additional entry. Turn the
+// old terminator into DT_NEEDED and extend the section and its containing
+// segment by eight bytes so the existing padding becomes the new
+// terminator.
+//
+// There is no unused 23-byte run in .dynstr for "$ORIGIN/qizmo-sound.so".
+// Preserve the string table's size and every exported/imported symbol name
+// by sharing existing suffixes:
+//
+//	printf   -> the "printf" suffix in "vsprintf"
+//	sprintf  -> the "sprintf" suffix in "vsprintf"
+//	environ  -> the "environ" suffix in "__environ"
+//	_start   -> the "_start" suffix in "__bss_start"
+//
+// Move _etext and _edata into the former standalone printf/sprintf storage.
+// Their old storage then joins the standalone environ/_start storage into a
+// 29-byte run, large enough for the dependency and six trailing zero bytes.
+// The dynamic symbol table still resolves to exactly the same names.
+var soundPatch = patch{
+	Name:        "sound",
+	Description: "load qizmo-sound.so through ELF metadata",
+	Replacements: []replacement{
+		{
+			Name:   "relocated _etext and _edata names",
+			Offset: 0xd21,
+			Before: []byte("printf\x00sprintf\x00"),
+			After:  []byte("_etext\x00_edata\x00\x00"),
+		},
+		{
+			Name:   "sound dependency name",
+			Offset: 0xf31,
+			Before: []byte(
+				"environ\x00_start\x00" +
+					"_etext\x00_edata\x00",
+			),
+			After: []byte(
+				soundLibraryDependency +
+					"\x00\x00\x00" +
+					"\x00\x00\x00\x00",
+			),
+		},
+		{
+			Name:   "printf name suffix",
+			Offset: 0x6ec,
+			Before: []byte{0x75, 0x01, 0x00, 0x00},
+			After:  []byte{0x86, 0x01, 0x00, 0x00},
+		},
+		{
+			Name:   "sprintf name suffix",
+			Offset: 0x6fc,
+			Before: []byte{0x7c, 0x01, 0x00, 0x00},
+			After:  []byte{0x85, 0x01, 0x00, 0x00},
+		},
+		{
+			Name:   "environ name suffix",
+			Offset: 0xb4c,
+			Before: []byte{0x85, 0x03, 0x00, 0x00},
+			After:  []byte{0x7d, 0x03, 0x00, 0x00},
+		},
+		{
+			Name:   "_start name suffix",
+			Offset: 0xb5c,
+			Before: []byte{0x8d, 0x03, 0x00, 0x00},
+			After:  []byte{0xa7, 0x03, 0x00, 0x00},
+		},
+		{
+			Name:   "_etext relocated name",
+			Offset: 0xb6c,
+			Before: []byte{0x94, 0x03, 0x00, 0x00},
+			After:  []byte{0x75, 0x01, 0x00, 0x00},
+		},
+		{
+			Name:   "_edata relocated name",
+			Offset: 0xb7c,
+			Before: []byte{0x9b, 0x03, 0x00, 0x00},
+			After:  []byte{0x7c, 0x01, 0x00, 0x00},
+		},
+		{
+			Name:   "sound DT_NEEDED entry",
+			Offset: 0x88e40,
+			Before: []byte{
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00,
+			},
+			After: []byte{
+				0x01, 0x00, 0x00, 0x00, 0x85, 0x03,
+				0x00, 0x00,
+			},
+		},
+		{
+			Name:   "writable load segment file size",
+			Offset: 0xa4,
+			Before: []byte{0xa8, 0x5f, 0x00, 0x00},
+			After:  []byte{0xb0, 0x5f, 0x00, 0x00},
+		},
+		{
+			Name:   "dynamic segment sizes",
+			Offset: 0xc4,
+			Before: []byte{
+				0x90, 0x00, 0x00, 0x00, 0x90, 0x00,
+				0x00, 0x00,
+			},
+			After: []byte{
+				0x98, 0x00, 0x00, 0x00, 0x98, 0x00,
+				0x00, 0x00,
+			},
+		},
+		{
+			Name:   "dynamic section size",
+			Offset: 0x8a4ec,
+			Before: []byte{0x90, 0x00, 0x00, 0x00},
+			After:  []byte{0x98, 0x00, 0x00, 0x00},
+		},
+	},
+}
+
+// Patch engine
+
+var patches = []patch{
+	integrityPatch,
+	bannerPatch,
+	userinfoPatch,
+	soundPatch,
+}
+
+// applyReplacement validates and applies one byte replacement.
+func applyReplacement(
+	output []byte, patchName string, replacement replacement,
+) error {
+	if len(replacement.Before) != len(replacement.After) {
+		return fmt.Errorf(
+			"%s/%s: replacement length is %d, want %d",
+			patchName,
+			replacement.Name,
+			len(replacement.After),
+			len(replacement.Before),
+		)
+	}
+
+	end := replacement.Offset + len(replacement.Before)
+	if replacement.Offset < 0 || end > len(output) {
+		return fmt.Errorf(
+			"%s/%s: offset %#x is outside the binary",
+			patchName,
+			replacement.Name,
+			replacement.Offset,
+		)
+	}
+
+	target := output[replacement.Offset:end]
+	if !bytes.Equal(target, replacement.Before) {
+		return fmt.Errorf(
+			"%s/%s: unexpected bytes at offset %#x",
+			patchName,
+			replacement.Name,
+			replacement.Offset,
+		)
+	}
+	copy(target, replacement.After)
+	return nil
+}
+
+// applyPatch applies every byte replacement belonging to one patch.
+func applyPatch(output []byte, current patch) error {
+	for _, replacement := range current.Replacements {
+		replacementErr := applyReplacement(
+			output, current.Name, replacement,
+		)
+		if replacementErr != nil {
+			return replacementErr
+		}
+	}
+	return nil
+}
+
+// verifyPatchedOutput catches accidental changes to the patch definitions.
+func verifyPatchedOutput(output []byte) error {
+	got := digest(output)
+	if got == patchedSHA256 {
+		return nil
+	}
+	return fmt.Errorf(
+		"internal error: patched sha256 is %s, want %s",
+		got,
+		patchedSHA256,
+	)
+}
+
+// applyPatches returns a patched copy of input. An already-patched input is
+// accepted and returned unchanged. Any other binary is rejected before it
+// can be modified.
+func applyPatches(input []byte) (output []byte, changed bool, err error) {
+	inputDigest := digest(input)
+	switch inputDigest {
+	case patchedSHA256:
+		return bytes.Clone(input), false, nil
+	case originalSHA256:
+		// Continue below.
+	default:
+		return nil, false, fmt.Errorf(
+			"unsupported Qizmo binary (sha256 %s, want %s)",
+			inputDigest,
+			originalSHA256,
+		)
+	}
+
+	output = bytes.Clone(input)
+	for _, current := range patches {
+		patchErr := applyPatch(output, current)
+		if patchErr != nil {
+			return nil, false, patchErr
+		}
+	}
+
+	if verifyErr := verifyPatchedOutput(output); verifyErr != nil {
+		return nil, false, verifyErr
+	}
+	return output, true, nil
+}
+
+func digest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// Command-line interface
+
+const patcherBanner = `
+ +------------------------------------------------------------------+
+ | QW QIZMO v2.91                                                   |
+ | COMPATIBILITY FIXES BY OSCAR LINDERHOLM, 2026                    |
+ +------------------------------------------------------------------+`
+
+func printPatchReport(inputPath, outputPath string, input, output []byte,
+	changed bool) {
+	fmt.Println(patcherBanner)
+	fmt.Printf("\n  INPUT   %s\n", inputPath)
+	fmt.Printf("  OUTPUT  %s\n", outputPath)
+	fmt.Printf("  SHA256  %s\n", digest(input))
+
+	if changed {
+		fmt.Println()
+		for index, patch := range patches {
+			fmt.Printf("  [%02d/%02d] %s: %s\n", index+1,
+				len(patches), patch.Name, patch.Description)
+		}
+	} else {
+		fmt.Println("\n  already patched: no changes required")
+	}
+
+	fmt.Printf("\n  VERIFY  %s\n", digest(output))
+	fmt.Printf("  WROTE   %s\n", outputPath)
+}
+
+func main() {
+	inputPath := flag.String(
+		"input", "", "original Qizmo 2.91 Linux binary",
+	)
+	outputPath := flag.String("output", "", "patched output binary")
+	flag.Parse()
+	if flag.NArg() != 0 {
+		fail("unexpected positional arguments")
+	}
+	if *inputPath == "" {
+		fail("-input is required")
+	}
+	if *outputPath == "" {
+		fail("-output is required")
+	}
+
+	input, err := os.ReadFile(*inputPath)
+	if err != nil {
+		fail("read %s: %v", *inputPath, err)
+	}
+	output, changed, err := applyPatches(input)
+	if err != nil {
+		fail("patch %s: %v", *inputPath, err)
+	}
+	if err := writeExecutable(*outputPath, output); err != nil {
+		fail("write %s: %v", *outputPath, err)
+	}
+	printPatchReport(*inputPath, *outputPath, input, output, changed)
+}
+
+func createTemporaryExecutable(
+	dir string, data []byte,
+) (name string, err error) {
+	tmp, err := os.CreateTemp(dir, ".qizmo-patch-*")
+	if err != nil {
+		return "", err
+	}
+	name = tmp.Name()
+	defer func() {
+		closeErr := tmp.Close()
+		if err == nil && closeErr != nil {
+			err = closeErr
+		}
+		if err != nil {
+			_ = os.Remove(name)
+		}
+	}()
+
+	if _, err = tmp.Write(data); err != nil {
+		return name, err
+	}
+	if err = tmp.Chmod(0o755); err != nil {
+		return name, err
+	}
+	return name, nil
+}
+
+func writeExecutable(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmpName, err := createTemporaryExecutable(dir, data)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+func fail(format string, args ...any) {
+	fmt.Fprint(os.Stderr, "\n  [ ABORT ] qizmo-patch :: ")
+	fmt.Fprintf(os.Stderr, format, args...)
+	fmt.Fprint(os.Stderr, "\n\n")
+	os.Exit(1)
+}
