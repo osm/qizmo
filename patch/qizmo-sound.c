@@ -72,7 +72,8 @@ extern int usleep(unsigned int);
 
 #define OSS_DEVICE_PATH   "/dev/dsp"
 #define ALSA_LIBRARY_NAME "libasound.so.2"
-#define ALSA_DEVICE_NAME  "default"
+/* Guarantee conversion when the system default exposes a fixed rate. */
+#define ALSA_DEVICE_NAME  "plug:default"
 
 #define PLAYBACK_FRAGMENTS 16
 #define PLAYBACK_FRAGMENT_BYTES 2048
