@@ -18,6 +18,14 @@ typedef long snd_pcm_sframes_t;
 typedef unsigned long snd_pcm_uframes_t;
 typedef void *(*thread_entry_t)(void *);
 
+/*
+ * Qizmo predates the 16-byte i386 stack-alignment convention used by
+ * current Linux libraries.  Realign every entry point called by Qizmo
+ * before it can call libc or ALSA; otherwise an aligned SSE access in a
+ * modern library may raise SIGSEGV with SI_KERNEL and a null fault address.
+ */
+#define QIZMO_CALLBACK __attribute__((force_align_arg_pointer))
+
 extern int close(int);
 extern int dlclose(void *);
 extern void *dlopen(const char *, int);
@@ -479,7 +487,7 @@ static int start_playback(void)
 
 /* Microphone capture callbacks installed into Qizmo. */
 
-static void close_capture_stream(void)
+static void QIZMO_CALLBACK close_capture_stream(void)
 {
 	if (capture_pcm) {
 		alsa_api.pcm_drop(capture_pcm);
@@ -505,7 +513,7 @@ static void clear_capture_samples(short *samples, int sample_count)
 		(unsigned int)sample_count * CAPTURE_SAMPLE_BYTES);
 }
 
-static int capture_read(short *samples, int sample_count)
+static int QIZMO_CALLBACK capture_read(short *samples, int sample_count)
 {
 	snd_pcm_sframes_t received_frames;
 
@@ -526,7 +534,7 @@ static int capture_read(short *samples, int sample_count)
 	return (int)received_frames;
 }
 
-static int capture_available(void)
+static int QIZMO_CALLBACK capture_available(void)
 {
 	snd_pcm_sframes_t frames;
 	if (!capture_pcm) {
@@ -540,7 +548,7 @@ static int capture_available(void)
 	return (int)frames;
 }
 
-static int capture_start(void)
+static int QIZMO_CALLBACK capture_start(void)
 {
 	if (capture_pcm) {
 		return 1;
@@ -651,7 +659,8 @@ static int open_oss_device(void)
 	return oss_fd;
 }
 
-static int qizmo_open_hook(const char *path, int flags, int mode)
+static int QIZMO_CALLBACK qizmo_open_hook(
+	const char *path, int flags, int mode)
 {
 	if (!strings_equal(path, OSS_DEVICE_PATH)) {
 		return open(path, flags, mode);
@@ -659,8 +668,8 @@ static int qizmo_open_hook(const char *path, int flags, int mode)
 	return open_oss_device();
 }
 
-static int qizmo_ioctl_hook(int descriptor, unsigned long request,
-	void *argument)
+static int QIZMO_CALLBACK qizmo_ioctl_hook(
+	int descriptor, unsigned long request, void *argument)
 {
 	if (descriptor != oss_fd) {
 		return ioctl(descriptor, request, argument);
@@ -709,7 +718,7 @@ static int close_oss_device(void)
 	return 0;
 }
 
-static int qizmo_close_hook(int descriptor)
+static int QIZMO_CALLBACK qizmo_close_hook(int descriptor)
 {
 	if (descriptor != oss_fd) {
 		return close(descriptor);
