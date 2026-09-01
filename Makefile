@@ -2,11 +2,12 @@
 
 CC ?= cc
 ARCH_FLAGS ?= -m32
+PATCH_GO_FILES := $(wildcard patch/*.go)
 
-all: qizmo
+all: qizmo qizmo.exe
 
 clean:
-	$(RM) qizmo qizmo-sound.so
+	$(RM) qizmo qizmo.exe qizmo-sound.so qizmo-patch
 	$(RM) -r dist
 
 docker:
@@ -15,10 +16,18 @@ docker:
 		--output type=local,dest=dist \
 		.
 
-qizmo: qizmo-2.91-linux patch/qizmo-patch.go qizmo-sound.so Makefile
-	go run patch/qizmo-patch.go \
-		-input qizmo-2.91-linux \
+qizmo: qizmo-2.91 qizmo-patch qizmo-sound.so Makefile
+	./qizmo-patch \
+		-input qizmo-2.91 \
 		-output qizmo
+
+qizmo.exe: qizmo-2.91.exe qizmo-patch Makefile
+	./qizmo-patch \
+		-input qizmo-2.91.exe \
+		-output qizmo.exe
+
+qizmo-patch: $(PATCH_GO_FILES) Makefile
+	go build -o qizmo-patch $(PATCH_GO_FILES)
 
 qizmo-sound.so: patch/qizmo-sound.c Makefile
 	$(CC) $(ARCH_FLAGS) \

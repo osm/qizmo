@@ -2,36 +2,15 @@ package main
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
-	"flag"
 	"fmt"
-	"os"
-	"path/filepath"
 )
 
 const (
-	originalSHA256 = "db4e91bbc40a03e422c4ebec1e1a27a1" +
+	linuxOriginalSHA256 = "db4e91bbc40a03e422c4ebec1e1a27a1" +
 		"45bdd0bbcd0fb498741b6281c92ee8ef"
-	patchedSHA256 = "d89552a997a5210be790a315e0ad2915" +
+	linuxPatchedSHA256 = "d89552a997a5210be790a315e0ad2915" +
 		"2988de38b9a473e3d69ad3677a98951e"
 )
-
-// replacement describes one validated patch site in the executable.
-type replacement struct {
-	Name   string
-	Offset int
-	Before []byte
-	After  []byte
-}
-
-// patch groups the byte changes for one independently understandable
-// modification. Patches are applied in the order listed here.
-type patch struct {
-	Name         string
-	Description  string
-	Replacements []replacement
-}
 
 // Integrity patch
 
@@ -54,7 +33,7 @@ type patch struct {
 // The skipped scanner and its two callbacks then have no remaining callers.
 // Their bytes are deliberately left intact for forensic comparison and may
 // be overwritten by later feature patches using the cave map below.
-var integrityPatch = patch{
+var linuxIntegrityPatch = bytePatch{
 	Name:        "integrity",
 	Description: "remove the integrity check",
 	Replacements: []replacement{
@@ -101,7 +80,7 @@ var integrityPatch = patch{
 // contiguous. Replacing the existing "\nF" banner boundary and its final
 // "\n\n" with same-size "%s" placeholders keeps the original banner
 // exactly the same size and does not change any other message.
-var bannerPatch = patch{
+var linuxBannerPatch = bytePatch{
 	Name:        "banner",
 	Description: "add the compatibility attribution and repository URL",
 	Replacements: []replacement{
@@ -195,15 +174,10 @@ var bannerPatch = patch{
 
 // Userinfo patch
 
-const (
-	originalLimit = 196
-	patchedLimit  = 1024
-)
-
 // Qizmo reserves different amounts of userinfo space for its own keys in
 // each path. Add 1024 - 196 to every historical threshold so those
 // reservations are preserved while adopting the modern QuakeWorld limit.
-var userinfoPatch = patch{
+var linuxUserinfoPatch = bytePatch{
 	Name: "userinfo",
 	Description: fmt.Sprintf(
 		"raise the userinfo limit from %d to %d bytes",
@@ -267,7 +241,7 @@ const soundLibraryDependency = "$ORIGIN/qizmo-sound.so"
 // Their old storage then joins the standalone environ/_start storage into a
 // 29-byte run, large enough for the dependency and six trailing zero bytes.
 // The dynamic symbol table still resolves to exactly the same names.
-var soundPatch = patch{
+var linuxSoundPatch = bytePatch{
 	Name:        "sound",
 	Description: "load qizmo-sound.so through ELF metadata",
 	Replacements: []replacement{
@@ -365,217 +339,40 @@ var soundPatch = patch{
 	},
 }
 
-// Patch engine
-
-var patches = []patch{
-	integrityPatch,
-	bannerPatch,
-	userinfoPatch,
-	soundPatch,
+var linuxPatches = []patch{
+	linuxIntegrityPatch,
+	linuxBannerPatch,
+	linuxUserinfoPatch,
+	linuxSoundPatch,
 }
 
-// applyReplacement validates and applies one byte replacement.
-func applyReplacement(
-	output []byte, patchName string, replacement replacement,
-) error {
-	if len(replacement.Before) != len(replacement.After) {
-		return fmt.Errorf(
-			"%s/%s: replacement length is %d, want %d",
-			patchName,
-			replacement.Name,
-			len(replacement.After),
-			len(replacement.Before),
-		)
-	}
-
-	end := replacement.Offset + len(replacement.Before)
-	if replacement.Offset < 0 || end > len(output) {
-		return fmt.Errorf(
-			"%s/%s: offset %#x is outside the binary",
-			patchName,
-			replacement.Name,
-			replacement.Offset,
-		)
-	}
-
-	target := output[replacement.Offset:end]
-	if !bytes.Equal(target, replacement.Before) {
-		return fmt.Errorf(
-			"%s/%s: unexpected bytes at offset %#x",
-			patchName,
-			replacement.Name,
-			replacement.Offset,
-		)
-	}
-	copy(target, replacement.After)
-	return nil
-}
-
-// applyPatch applies every byte replacement belonging to one patch.
-func applyPatch(output []byte, current patch) error {
-	for _, replacement := range current.Replacements {
-		replacementErr := applyReplacement(
-			output, current.Name, replacement,
-		)
-		if replacementErr != nil {
-			return replacementErr
-		}
-	}
-	return nil
-}
-
-// verifyPatchedOutput catches accidental changes to the patch definitions.
-func verifyPatchedOutput(output []byte) error {
-	got := digest(output)
-	if got == patchedSHA256 {
-		return nil
-	}
-	return fmt.Errorf(
-		"internal error: patched sha256 is %s, want %s",
-		got,
-		patchedSHA256,
-	)
-}
-
-// applyPatches returns a patched copy of input. An already-patched input is
-// accepted and returned unchanged. Any other binary is rejected before it
-// can be modified.
-func applyPatches(input []byte) (output []byte, changed bool, err error) {
-	inputDigest := digest(input)
+func patchLinux(
+	input []byte,
+	inputDigest string,
+) (*patchResult, bool, error) {
 	switch inputDigest {
-	case patchedSHA256:
-		return bytes.Clone(input), false, nil
-	case originalSHA256:
-		// Continue below.
-	default:
-		return nil, false, fmt.Errorf(
-			"unsupported Qizmo binary (sha256 %s, want %s)",
-			inputDigest,
-			originalSHA256,
+	case linuxPatchedSHA256:
+		return &patchResult{
+			Output:   bytes.Clone(input),
+			Platform: "linux",
+		}, true, nil
+	case linuxOriginalSHA256:
+		output, steps, err := applyPatchSequence(
+			input,
+			linuxPatches,
+			nil,
+			linuxPatchedSHA256,
 		)
-	}
-
-	output = bytes.Clone(input)
-	for _, current := range patches {
-		patchErr := applyPatch(output, current)
-		if patchErr != nil {
-			return nil, false, patchErr
-		}
-	}
-
-	if verifyErr := verifyPatchedOutput(output); verifyErr != nil {
-		return nil, false, verifyErr
-	}
-	return output, true, nil
-}
-
-func digest(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
-
-// Command-line interface
-
-const patcherBanner = `
- +------------------------------------------------------------------+
- | QW QIZMO v2.91                                                   |
- | COMPATIBILITY FIXES BY OSCAR LINDERHOLM, 2026                    |
- +------------------------------------------------------------------+`
-
-func printPatchReport(inputPath, outputPath string, input, output []byte,
-	changed bool) {
-	fmt.Println(patcherBanner)
-	fmt.Printf("\n  INPUT   %s\n", inputPath)
-	fmt.Printf("  OUTPUT  %s\n", outputPath)
-	fmt.Printf("  SHA256  %s\n", digest(input))
-
-	if changed {
-		fmt.Println()
-		for index, patch := range patches {
-			fmt.Printf("  [%02d/%02d] %s: %s\n", index+1,
-				len(patches), patch.Name, patch.Description)
-		}
-	} else {
-		fmt.Println("\n  already patched: no changes required")
-	}
-
-	fmt.Printf("\n  VERIFY  %s\n", digest(output))
-	fmt.Printf("  WROTE   %s\n", outputPath)
-}
-
-func main() {
-	inputPath := flag.String(
-		"input", "", "original Qizmo 2.91 Linux binary",
-	)
-	outputPath := flag.String("output", "", "patched output binary")
-	flag.Parse()
-	if flag.NArg() != 0 {
-		fail("unexpected positional arguments")
-	}
-	if *inputPath == "" {
-		fail("-input is required")
-	}
-	if *outputPath == "" {
-		fail("-output is required")
-	}
-
-	input, err := os.ReadFile(*inputPath)
-	if err != nil {
-		fail("read %s: %v", *inputPath, err)
-	}
-	output, changed, err := applyPatches(input)
-	if err != nil {
-		fail("patch %s: %v", *inputPath, err)
-	}
-	if err := writeExecutable(*outputPath, output); err != nil {
-		fail("write %s: %v", *outputPath, err)
-	}
-	printPatchReport(*inputPath, *outputPath, input, output, changed)
-}
-
-func createTemporaryExecutable(
-	dir string, data []byte,
-) (name string, err error) {
-	tmp, err := os.CreateTemp(dir, ".qizmo-patch-*")
-	if err != nil {
-		return "", err
-	}
-	name = tmp.Name()
-	defer func() {
-		closeErr := tmp.Close()
-		if err == nil && closeErr != nil {
-			err = closeErr
-		}
 		if err != nil {
-			_ = os.Remove(name)
+			return nil, true, err
 		}
-	}()
-
-	if _, err = tmp.Write(data); err != nil {
-		return name, err
+		return &patchResult{
+			Output:   output,
+			Changed:  true,
+			Platform: "linux",
+			Steps:    steps,
+		}, true, nil
+	default:
+		return nil, false, nil
 	}
-	if err = tmp.Chmod(0o755); err != nil {
-		return name, err
-	}
-	return name, nil
-}
-
-func writeExecutable(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	tmpName, err := createTemporaryExecutable(dir, data)
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		return err
-	}
-	return nil
-}
-
-func fail(format string, args ...any) {
-	fmt.Fprint(os.Stderr, "\n  [ ABORT ] qizmo-patch :: ")
-	fmt.Fprintf(os.Stderr, format, args...)
-	fmt.Fprint(os.Stderr, "\n\n")
-	os.Exit(1)
 }

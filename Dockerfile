@@ -12,7 +12,7 @@ RUN apt-get update \
 
 WORKDIR /src
 
-COPY Makefile qizmo-2.91-linux ./
+COPY Makefile qizmo-2.91 qizmo-2.91.exe ./
 COPY patch ./patch
 
 RUN make
@@ -20,4 +20,5 @@ RUN make
 FROM scratch AS artifacts
 
 COPY --from=build /src/qizmo /
+COPY --from=build /src/qizmo.exe /
 COPY --from=build /src/qizmo-sound.so /
